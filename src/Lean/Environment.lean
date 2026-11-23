@@ -611,6 +611,12 @@ structure Environment where
   -/
   checked             : Task Kernel.Environment := private_decl% (.pure base.private)
   /--
+  Kernel environment task that may be fulfilled before `checked` is. It contains the same constants
+  with the same types, but a theorem whose proof is still being checked is represented by an axiom.
+  `none` if no such task is known; see `prelimChecked`.
+  -/
+  private prelimChecked? : Option (Task Kernel.Environment) := none
+  /--
   Container of asynchronously elaborated declarations. For consistency, `Lean.addDecl` makes sure
   this contains constants added even synchronously, i.e. `base ⨃ asyncConsts` is the set of
   constants known on the current environment branch, which is a subset of `checked`.
@@ -798,11 +804,21 @@ def setRecordingDeps (env : Environment) (recording : Bool) : Environment :=
 
 /-- Consistently updates synchronous and (private) asynchronous parts of the environment without blocking. -/
 private def modifyCheckedAsync (env : Environment) (f : Kernel.Environment → Kernel.Environment) : Environment :=
-  { env with checked := env.checked.map (sync := true) f, base.private := f env.base.private }
+  { env with
+    checked := env.checked.map (sync := true) f
+    prelimChecked? := env.prelimChecked?.map (·.map (sync := true) f)
+    base.private := f env.base.private }
 
 /-- Sets synchronous and (private) asynchronous parts of the environment to the given kernel environment. -/
 private def setCheckedSync (env : Environment) (newChecked : Kernel.Environment) : Environment :=
-  { env with checked := .pure newChecked, base.private := newChecked }
+  { env with checked := .pure newChecked, prelimChecked? := none, base.private := newChecked }
+
+/--
+Kernel environment task for checking declarations against: like `checked`, but it does not wait for
+theorem proofs that are checked concurrently, which it represents by axioms of the same type.
+-/
+def prelimChecked (env : Environment) : Task Kernel.Environment :=
+  env.prelimChecked?.getD env.checked
 
 /-- The declaration prefix to which the environment is restricted to, if any. -/
 def asyncPrefix? (env : Environment) : Option Name :=
@@ -870,6 +886,31 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
       } }
 
   return env
+
+/--
+Adds a theorem whose proof is checked concurrently: `prelim` and `checked` must be `env.prelimChecked`
+and `env.checked` extended by a constant with the name and type of `thm`, where `prelim` is not
+expected to wait for the proof to be checked.
+
+This is a plumbing function for the implementation of `Lean.addDecl`.
+-/
+def addTheoremWithTasks (env : Environment) (thm : TheoremVal)
+    (prelim checked : Task Kernel.Environment) : Except Kernel.Exception Environment := do
+  if let some ctx := env.asyncCtx? then
+    unless ctx.mayContain thm.name do
+      throw <| .other s!"cannot add declaration {thm.name} to environment as it is restricted to \
+        the prefix {ctx.declPrefix}"
+  let env := env.registerConstAdded thm.name
+  let c : AsyncConst := {
+    constInfo := .ofConstantInfo (.thmInfo thm)
+    exts? := none
+    aconstsImpl := .pure <| .mk (α := AsyncConsts) default
+  }
+  return { env with
+    checked
+    prelimChecked? := some prelim
+    asyncConstsMap.private := env.asyncConstsMap.private.add c
+    asyncConstsMap.public := env.asyncConstsMap.public.add c }
 
 @[inherit_doc Kernel.Environment.constants]
 def constants (env : Environment) : ConstMap :=
@@ -1085,7 +1126,8 @@ def promiseChecked (env : Environment) : BaseIO PromiseCheckedResult := do
     mainEnv := { env with
       checked := checkedEnvPromise.result?.bind (sync := true) fun
         | some kenv => .pure kenv
-        | none      => env.checked }
+        | none      => env.checked
+      prelimChecked? := none }
     -- Do not allow adding new constants
     asyncEnv := env.enterAsync `__reserved__Environment_promiseChecked
     checkedEnvPromise
@@ -1129,6 +1171,7 @@ structure AddConstAsyncResult where
   private sigPromise : IO.Promise ConstantVal
   private constPromise : IO.Promise ConstPromiseVal
   private checkedEnvPromise : IO.Promise Kernel.Environment
+  private prelimCheckedEnvPromise : IO.Promise Kernel.Environment
   private allRealizationsPromise : IO.Promise (NameMap AsyncConst)
 
 /-- Creates fallback info to be used in case promises are dropped unfulfilled. -/
@@ -1175,6 +1218,7 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
   let constPromise ← IO.Promise.new
   let allRealizationsPromise ← IO.Promise.new
   let checkedEnvPromise ← IO.Promise.new
+  let prelimCheckedEnvPromise ← IO.Promise.new
 
   let privateAsyncConst := {
     constInfo := {
@@ -1225,11 +1269,14 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
       checked := checkedEnvPromise.result?.bind (sync := true) fun
         | some kenv => .pure kenv
         | none      => env.checked
+      prelimChecked? := some <| prelimCheckedEnvPromise.result?.bind (sync := true) fun
+        | some kenv => .pure kenv
+        | none      => env.prelimChecked
       allRealizations := allRealizationsPromise.result?.bind (sync := true) fun
         | some r => .pure r
         | none   => env.allRealizations }
     asyncEnv := env.enterAsync constName
-    sigPromise, constPromise, allRealizationsPromise, checkedEnvPromise
+    sigPromise, constPromise, allRealizationsPromise, checkedEnvPromise, prelimCheckedEnvPromise
   }
 
 /--
@@ -1292,6 +1339,7 @@ def AddConstAsyncResult.commitCheckEnv (res : AddConstAsyncResult) (env : Enviro
   -- `info?`
   if !(← res.constPromise.isResolved) then
     res.commitConst env
+  BaseIO.chainTask (sync := true) env.prelimChecked res.prelimCheckedEnvPromise.resolve
   BaseIO.chainTask (sync := true) env.checked fun checked => do
     res.checkedEnvPromise.resolve checked
     BaseIO.chainTask (sync := true) env.allRealizations res.allRealizationsPromise.resolve
@@ -2849,7 +2897,7 @@ namespace Environment
 
 @[export lean_elab_environment_update_base_after_kernel_add]
 private def updateBaseAfterKernelAdd (env : Environment) (kenv : Kernel.Environment) : Environment :=
-  { env with checked := .pure kenv }
+  { env with checked := .pure kenv, prelimChecked? := none }
 
 def displayStats (env : Environment) : IO Unit := do
   let pExtDescrs ← persistentEnvExtensionsRef.get
@@ -2928,6 +2976,7 @@ def replayConsts (dest : Environment) (oldEnv newEnv : Environment) (skipExistin
       oldEnv.checked.bind (sync := true) fun oldKEnv =>
         newEnv.checked.map fun newKEnv =>
           replayKernel oldKEnv newKEnv exts newPrivateConsts kenv |>.toOption.getD kenv
+    prelimChecked? := none
     allRealizations := dest.allRealizations.map (sync := true) fun allRealizations =>
       newPrivateConsts.foldl (init := allRealizations) fun allRealizations c =>
         allRealizations.insert c.constInfo.name c
@@ -3143,6 +3192,7 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
         | .error e => do
           exPromise.resolve e
           return kenv)
+    prelimChecked? := none
     allRealizations := env.allRealizations.map (sync := true) fun allRealizations =>
       res.newConsts.private.foldl (init := allRealizations) fun allRealizations c =>
         allRealizations.insert c.constInfo.name c
