@@ -116,6 +116,27 @@ private def Kernel.Environment.addTheoremAsAxiom (env : Environment) (opts : Opt
     <|> add (mkApp2 (mkConst ``sorryAx [1]) (mkSort 0) (mkConst ``true)) []
     |>.getD env
 
+register_builtin_option Elab.memoizeKernelCheck : Bool := {
+  defValue := true
+  descr    := "under `Elab.parallelKernelCheck`, do not check a theorem again that has the same \
+    type and proof as a theorem accepted before and refers to imported constants only. Tactics \
+    often produce such duplicates as auxiliary theorems of different declarations."
+}
+
+/-- Level parameters, type, and proof of a theorem. -/
+private abbrev TheoremKey := List Name × Expr × Expr
+
+/--
+Theorems accepted by the kernel that refer to imported constants only, which makes the result
+independent of the environment branch. The set is shared by all branches of an environment.
+-/
+private structure CheckedClosedTheorems where
+  ref? : Option (IO.Ref (Std.HashSet TheoremKey)) := none
+  deriving Inhabited
+
+private builtin_initialize checkedClosedTheoremsExt : EnvExtension CheckedClosedTheorems ←
+  registerEnvExtension (return { ref? := some (← IO.mkRef {}) }) (asyncMode := .local)
+
 builtin_initialize
   registerTraceClass `addDecl
 
@@ -255,8 +276,25 @@ where
     profileitM Exception "type checking" (← getOptions) do
       withTraceNode `Kernel (fun _ => return m!"typechecking declarations {decl.getTopLevelNames}") do
         warnIfUsesSorry decl
+        let memo? ← closedTheoremMemo?
+        if let some (ref, key) := memo? then
+          if (← ref.get).contains key then
+            return
         discard <| ofExceptKernelException <|
           kenv.addDecl (← getOptions) decl (← read).cancelTk?
+        if let some (ref, key) := memo? then
+          ref.modify (·.insert key)
+  /-- The memo table and key for `decl` if its check does not depend on the environment branch. -/
+  closedTheoremMemo? : CoreM (Option (IO.Ref (Std.HashSet TheoremKey) × TheoremKey)) := do
+    let .thmDecl thm := decl | return none
+    unless Elab.memoizeKernelCheck.get (← getOptions) do return none
+    let env ← getEnv
+    let some ref := (checkedClosedTheoremsExt.getState env).ref? | return none
+    let isImported (n : Name) := (env.getModuleIdxFor? n).isSome
+    unless thm.type.getUsedConstantsAsSet.all isImported &&
+        thm.value.getUsedConstantsAsSet.all isImported do
+      return none
+    return some (ref, (thm.levelParams, thm.type, thm.value))
   addAsAxiom := do
     -- try to add as axiom with given type for def/theorem
     match decl with

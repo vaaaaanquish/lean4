@@ -3,6 +3,8 @@ import Lean
 /-!
 Tests `Elab.parallelKernelCheck`: theorem proofs are checked by the kernel on separate tasks, later
 declarations do not wait for these checks, and a proof rejected by the kernel is still reported.
+Also tests `Elab.memoizeKernelCheck`, which skips the check of a theorem that repeats an accepted
+one but must not skip it for a rejected one.
 -/
 
 open Lean Elab Tactic
@@ -53,3 +55,33 @@ theorem badNested : True ∧ (False → False) := ⟨trivial, fun _ => by bogus_
 /-- info: 'ok₂' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms ok₂
+
+-- Identical statements and proofs referring to imported constants only: the second check is skipped.
+theorem dup₁ (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega
+theorem dup₂ (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega
+
+set_option Elab.memoizeKernelCheck false in
+theorem dup₃ (a b : Nat) (h : a < b) : a + 1 ≤ b := by omega
+
+/--
+error: (kernel) declaration type mismatch, 'badDup₁' has type
+  True
+but it is expected to have type
+  False
+-/
+#guard_msgs in
+theorem badDup₁ : False := by bogus_proof
+
+-- A rejected proof is not memoized, so its repetition is rejected as well.
+/--
+error: (kernel) declaration type mismatch, 'badDup₂' has type
+  True
+but it is expected to have type
+  False
+-/
+#guard_msgs in
+theorem badDup₂ : False := by bogus_proof
+
+/-- info: 'badDup₂' depends on axioms: [badDup₂] -/
+#guard_msgs in
+#print axioms badDup₂
