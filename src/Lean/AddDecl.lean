@@ -95,6 +95,48 @@ def warnIfUsesSorry (decl : Declaration) : CoreM Unit := do
         -- This case should not happen, but it ensures a warning will get logged no matter what.
         logWarning <| .tagged `hasSorry m!"declaration uses `sorry`"
 
+register_builtin_option Elab.parallelKernelCheck : Bool := {
+  defValue := true
+  descr    := "under `Elab.async`, check theorem proofs in the kernel concurrently instead of one \
+    after the other. As no declaration can depend on the proof of a theorem, checking later \
+    declarations does not wait for it. A theorem whose proof is rejected is reported and replaced \
+    by an axiom as usual."
+}
+
+/--
+Adds `thm` as an axiom, or as an axiom of type `sorry` if its type is rejected as well; this is how a
+theorem with a rejected proof is represented.
+-/
+private def Kernel.Environment.addTheoremAsAxiom (env : Environment) (opts : Options)
+    (thm : TheoremVal) : Environment :=
+  let add (type : Expr) (levelParams : List Name) :=
+    env.addDecl opts (.axiomDecl { name := thm.name, levelParams, type, isUnsafe := false })
+      |>.toOption
+  add thm.type thm.levelParams
+    <|> add (mkApp2 (mkConst ``sorryAx [1]) (mkSort 0) (mkConst ``true)) []
+    |>.getD env
+
+register_builtin_option Elab.memoizeKernelCheck : Bool := {
+  defValue := true
+  descr    := "under `Elab.parallelKernelCheck`, do not check a theorem again that has the same \
+    type and proof as a theorem accepted before and refers to imported constants only. Tactics \
+    often produce such duplicates as auxiliary theorems of different declarations."
+}
+
+/-- Level parameters, type, and proof of a theorem. -/
+private abbrev TheoremKey := List Name × Expr × Expr
+
+/--
+Theorems accepted by the kernel that refer to imported constants only, which makes the result
+independent of the environment branch. The set is shared by all branches of an environment.
+-/
+private structure CheckedClosedTheorems where
+  ref? : Option (IO.Ref (Std.HashSet TheoremKey)) := none
+  deriving Inhabited
+
+private builtin_initialize checkedClosedTheoremsExt : EnvExtension CheckedClosedTheorems ←
+  registerEnvExtension (return { ref? := some (← IO.mkRef {}) }) (asyncMode := .local)
+
 builtin_initialize
   registerTraceClass `addDecl
 
@@ -178,8 +220,33 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
     finally
       async.commitCheckEnv (← getEnv)
 
-  if Elab.async.get (← getOptions) then
+  let opts ← getOptions
+  if Elab.async.get opts then
     let cancelTk ← IO.CancelToken.new
+    if let .thmDecl thm := decl then
+      -- Kernel diagnostics are accumulated in the checked environment, which the concurrent check
+      -- does not produce.
+      if Elab.parallelKernelCheck.get opts && !debug.skipKernelTC.get opts &&
+          !diagnostics.get opts then
+        let aenv := async.asyncEnv
+        let okPromise : IO.Promise Bool ← IO.Promise.new
+        let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun kenv => do
+          try
+            checkOnly kenv
+            okPromise.resolve true
+          catch ex =>
+            okPromise.resolve false
+            throw ex
+        let t ← BaseIO.mapTask checkAct aenv.prelimChecked
+        Core.logSnapshotTask { stx? := none, reportingRange := .skip, task := t, cancelTk? := cancelTk }
+        let prelim := aenv.prelimChecked.map (sync := true) (·.addTheoremAsAxiom opts thm)
+        let checked := aenv.checked.bind (sync := true) fun kenv =>
+          okPromise.result?.map (sync := true) fun
+            | some true => kenv.addDeclWithoutChecking decl |>.toOption.getD kenv
+            | _         => kenv.addTheoremAsAxiom opts thm
+        let aenv ← ofExceptKernelException <| aenv.addTheoremWithTasks thm prelim checked
+        async.commitCheckEnv aenv
+        return
     let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => doAddAndCommit
     let t ← BaseIO.mapTask checkAct env.checked
     -- Do not display reporting range; most uses of `addDecl` are for registering auxiliary decls
@@ -204,6 +271,30 @@ where
           -- avoid follow-up errors by (trying to) add broken decl as axiom
           addAsAxiom
           throw ex
+  /-- Checks `decl` against `kenv`, which must not contain it yet, and discards the result. -/
+  checkOnly (kenv : Kernel.Environment) : CoreM Unit := do
+    profileitM Exception "type checking" (← getOptions) do
+      withTraceNode `Kernel (fun _ => return m!"typechecking declarations {decl.getTopLevelNames}") do
+        warnIfUsesSorry decl
+        let memo? ← closedTheoremMemo?
+        if let some (ref, key) := memo? then
+          if (← ref.get).contains key then
+            return
+        discard <| ofExceptKernelException <|
+          kenv.addDecl (← getOptions) decl (← read).cancelTk?
+        if let some (ref, key) := memo? then
+          ref.modify (·.insert key)
+  /-- The memo table and key for `decl` if its check does not depend on the environment branch. -/
+  closedTheoremMemo? : CoreM (Option (IO.Ref (Std.HashSet TheoremKey) × TheoremKey)) := do
+    let .thmDecl thm := decl | return none
+    unless Elab.memoizeKernelCheck.get (← getOptions) do return none
+    let env ← getEnv
+    let some ref := (checkedClosedTheoremsExt.getState env).ref? | return none
+    let isImported (n : Name) := (env.getModuleIdxFor? n).isSome
+    unless thm.type.getUsedConstantsAsSet.all isImported &&
+        thm.value.getUsedConstantsAsSet.all isImported do
+      return none
+    return some (ref, (thm.levelParams, thm.type, thm.value))
   addAsAxiom := do
     -- try to add as axiom with given type for def/theorem
     match decl with
